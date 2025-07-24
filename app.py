@@ -18,6 +18,9 @@ GARMENT_TYPES = [
     "All-over Print Tee",
 ]
 
+# Session shipping cache (variant_id, country_code) -> shipping_cents
+shipping_cache = {}
+
 def extract_garment_type(title):
     for gtype in GARMENT_TYPES:
         if re.search(re.escape(gtype), title, re.IGNORECASE):
@@ -65,15 +68,30 @@ def get_all_variants(product_id, shop_id):
         headers={"Authorization": f"Bearer {API_KEY}"}
     )
     prod = r.json()
-    variants = prod.get("variants", [])
-    return variants
+    return prod.get("variants", [])
+
+def get_variant_shipping_cost(variant_id, country_code="US"):
+    if not variant_id:
+        return None
+    key = (variant_id, country_code)
+    if key in shipping_cache:
+        return shipping_cache[key]
+    url = f"https://api.printify.com/v1/shipping.json?country={country_code}&variant_id={variant_id}"
+    resp = requests.get(url, headers={"Authorization": f"Bearer {API_KEY}"})
+    if resp.status_code == 200:
+        data = resp.json()
+        if "standard" in data:
+            price = data["standard"].get("cost", None)
+            if price is not None:
+                shipping_cache[key] = price
+                return price
+    shipping_cache[key] = None
+    return None
 
 def update_all_prices_bulk_retail(product_id, shop_id, target_retail):
-    """Set the retail price for the default variant, and all others match the same margin % as the default."""
     variants = get_all_variants(product_id, shop_id)
     if not variants:
         return None, variants, []
-    # Identify default (or first) variant
     default_variant = None
     for v in variants:
         if v.get("is_default"):
@@ -115,6 +133,12 @@ def index():
     except Exception as e:
         return str(e), 400
 
+    # Attach shipping cost per variant (default only for this UI)
+    for prod in detailed:
+        for v in prod["variants"]:
+            if v:
+                v["shipping_cost"] = get_variant_shipping_cost(v.get("id"))
+
     html = '''<!DOCTYPE html>
     <html>
     <head>
@@ -123,8 +147,8 @@ def index():
             body { font-family: sans-serif; margin: 2em; background: #f9f9fb;}
             .prod { background: #fff; border-radius: 14px; margin-bottom: 2em; padding: 1.5em; box-shadow: 0 2px 8px #0001; position: relative;}
             .prod h2 { margin: 0 0 0.5em; }
-            table { width: 100%; border-collapse: collapse; }
-            th, td { padding: 0.4em 0.6em; }
+            table { width: 100%; border-collapse: collapse; table-layout: fixed;}
+            th, td { padding: 0.4em 0.6em; text-align: center; vertical-align: middle;}
             th { background: #f0f0f7; }
             td { border-top: 1px solid #eee; }
             .profit-pos { color: green; font-weight: bold;}
@@ -143,7 +167,7 @@ def index():
             .flash-error {padding:1em; background:#ffe1e1; color:#a32c2c; margin-bottom:1em; border-radius:8px;}
             .select-checkbox {position:absolute;top:16px;left:16px;zoom:1.3;}
             .scroll-table {max-height:320px;overflow:auto;border-radius:8px;box-shadow:0 1px 6px #0002;}
-            .scroll-table table {line-height:4;}
+            .scroll-table table {line-height:2;}
             #bulk-edit-bar {display:none; margin-bottom: 2em; background: #222; color: #fff; padding: 1.2em 1.2em 0.9em 1.2em; border-radius: 1em; box-shadow: 0 2px 16px #0005;}
             #bulk-edit-bar input {margin-left:0.5em;margin-right:1em;}
             #bulk-edit-bar label {font-weight:600;}
@@ -220,6 +244,7 @@ def index():
                         <th>Cost</th>
                         <th>Profit</th>
                         <th>Margin %</th>
+                        <th>Shipping</th>
                         <th></th>
                     </tr>
                 </thead>
@@ -252,12 +277,19 @@ def index():
                                 {{ percent }}%
                             </span>
                         </td>
+                        <td>
+                            {% if v.shipping_cost is not none %}
+                                ${{ '%.2f' % (v.shipping_cost / 100) }}
+                            {% else %}
+                                N/A
+                            {% endif %}
+                        </td>
                         <td class="edit-icons">
                             <button onclick="showEdit('{{p.id}}')" title="Edit all variants">&#9998;</button>
                         </td>
                     </tr>
                     <tr id="editbox_{{p.id}}" class="editbox" style="display:none;">
-                        <td colspan="6">
+                        <td colspan="7">
                             <form class="editform" method="POST" action="{{ url_for('edit_price_all') }}">
                                 <input type="hidden" name="product_id" value="{{p.id}}">
                                 <input type="hidden" name="variant_id" value="{{v.id}}">
@@ -333,9 +365,6 @@ def index():
             document.querySelectorAll('.select-checkbox').forEach(cb=>{ cb.checked=false; });
             updateBulkBar();
         }
-        function onFilterChanged() {
-            clearSelections();
-        }
         function filterByType() {
             var t = document.getElementById('gtype').value;
             document.querySelectorAll('.prod').forEach(function(p){
@@ -398,6 +427,7 @@ def index():
     </body>
     </html>'''
     return render_template_string(html, products=detailed, found_types=found_types, messages=messages)
+
 
 @app.route("/bulk_edit", methods=["POST"])
 def bulk_edit():
