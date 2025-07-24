@@ -22,13 +22,13 @@ Supports price updates by retail, margin %, or profit—while preserving your pr
 ### 1. Clone the Repository
 
 ```sh
-git clone https://github.com/yourusername/printify-price-manager.git
+git clone https://github.com/blahpunk/printify-price-manager.git
 cd printify-price-manager
 ```
 
 ### 2. Create and Configure Your `.env` File
 
-Copy `.env.sample` to `.env` and set your credentials:
+Copy `.env-sample` to `.env` and set your credentials:
 
 ```sh
 cp .env.sample .env
@@ -54,7 +54,7 @@ Never commit your real `.env` file to a public repo.*
 ### 3. Get Your Printify API Key
 
 - Log in to your [Printify account](https://printify.com/)
-- Go to **My Account → API tokens**
+- Go to **My Account → API tokens** (https://printify.com/app/account/api)
 - Create a new API token with read and write permissions
 - Copy the key and paste it as `PRINTIFY_API_KEY` in your `.env` file
 
