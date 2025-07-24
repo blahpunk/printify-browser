@@ -1,7 +1,7 @@
 import os
 import re
 import requests
-from flask import Flask, render_template_string, request, redirect, url_for, flash
+from flask import Flask, render_template_string, request, redirect, url_for, flash, get_flashed_messages
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -45,33 +45,83 @@ def get_shop_and_products():
             f"https://api.printify.com/v1/shops/{shop_id}/products/{prod['id']}.json",
             headers={"Authorization": f"Bearer {API_KEY}"}
         ).json()
-        if "variants" in prod_details:
-            default_variants = [v for v in prod_details["variants"] if v.get("is_default")]
-            if default_variants:
-                prod_details["variants"] = default_variants
-            else:
-                prod_details["variants"] = prod_details["variants"][:1]
+        variants = prod_details.get("variants", [])
+        default_variant = None
+        for v in variants:
+            if v.get("is_default"):
+                default_variant = v
+                break
+        if not default_variant and variants:
+            default_variant = variants[0]
+        prod_details["variants"] = [default_variant] if default_variant else []
         prod_details["garment_type"] = extract_garment_type(prod_details.get("title", ""))
         detailed.append(prod_details)
     found_types = sorted({p["garment_type"] for p in detailed if p["garment_type"] in GARMENT_TYPES})
     return shop_id, detailed, found_types
 
+def get_all_variants(product_id, shop_id):
+    r = requests.get(
+        f"https://api.printify.com/v1/shops/{shop_id}/products/{product_id}.json",
+        headers={"Authorization": f"Bearer {API_KEY}"}
+    )
+    prod = r.json()
+    variants = prod.get("variants", [])
+    return variants
+
+def update_all_prices_bulk_retail(product_id, shop_id, target_retail):
+    """Set the retail price for the default variant, and all others match the same margin % as the default."""
+    variants = get_all_variants(product_id, shop_id)
+    if not variants:
+        return None, variants, []
+    # Identify default (or first) variant
+    default_variant = None
+    for v in variants:
+        if v.get("is_default"):
+            default_variant = v
+            break
+    if not default_variant:
+        default_variant = variants[0]
+    cost = default_variant.get("cost", 0) / 100
+    retail = float(target_retail)
+    margin = ((retail - cost) / retail) if retail > 0 else 0
+    updated = []
+    for v in variants:
+        v_cost = v.get("cost", 0) / 100
+        v_price = round(v_cost / (1 - margin) + 0.00001, 2) if margin < 1.0 else v_cost
+        variant_payload = {
+            "id": v["id"],
+            "price": int(round(v_price * 100)),
+            "is_enabled": v.get("is_enabled", True),
+            "is_visible": v.get("is_visible", True)
+        }
+        updated.append(variant_payload)
+    patch_url = f"https://api.printify.com/v1/shops/{shop_id}/products/{product_id}.json"
+    payload = {"variants": updated}
+    resp = requests.put(
+        patch_url,
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json=payload
+    )
+    return resp, variants, updated
+
 @app.route("/", methods=["GET"])
 def index():
-    msg = request.args.get("msg")
+    messages = get_flashed_messages(with_categories=True)
     try:
         shop_id, detailed, found_types = get_shop_and_products()
     except Exception as e:
         return str(e), 400
 
-    html = '''
-    <!DOCTYPE html>
+    html = '''<!DOCTYPE html>
     <html>
     <head>
         <title>Printify Product Price Breakdown</title>
         <style>
             body { font-family: sans-serif; margin: 2em; background: #f9f9fb;}
-            .prod { background: #fff; border-radius: 14px; margin-bottom: 2em; padding: 1.5em; box-shadow: 0 2px 8px #0001;}
+            .prod { background: #fff; border-radius: 14px; margin-bottom: 2em; padding: 1.5em; box-shadow: 0 2px 8px #0001; position: relative;}
             .prod h2 { margin: 0 0 0.5em; }
             table { width: 100%; border-collapse: collapse; }
             th, td { padding: 0.4em 0.6em; }
@@ -88,63 +138,70 @@ def index():
             .edit-icons button {border:none;background:none;cursor:pointer;}
             .editbox { background:#eef; padding:1em; border-radius:8px; margin-bottom:1em;}
             .editlabel { font-weight: bold; }
+            .updated-row { background: #e4fcd7; }
+            .flash-success {padding:1em; background:#dff0d8; color:#3c763d; margin-bottom:1em; border-radius:8px;}
+            .flash-error {padding:1em; background:#ffe1e1; color:#a32c2c; margin-bottom:1em; border-radius:8px;}
+            .select-checkbox {position:absolute;top:16px;left:16px;zoom:1.3;}
+            .scroll-table {max-height:320px;overflow:auto;border-radius:8px;box-shadow:0 1px 6px #0002;}
+            .scroll-table table {line-height:4;}
+            #bulk-edit-bar {display:none; margin-bottom: 2em; background: #222; color: #fff; padding: 1.2em 1.2em 0.9em 1.2em; border-radius: 1em; box-shadow: 0 2px 16px #0005;}
+            #bulk-edit-bar input {margin-left:0.5em;margin-right:1em;}
+            #bulk-edit-bar label {font-weight:600;}
+            #bulk-edit-bar .editlabel {color:#6fa84f;}
+            #bulk-edit-bar button {margin-left:1em;}
+            #job-flash-messages {position:relative;}
+            #close-job-msg { position: absolute; right: 12px; top: 12px; background: #ccc; color: #222; border: none; border-radius: 50%; width: 28px; height: 28px; font-size: 1.6em; line-height: 1; cursor:pointer; z-index: 10;}
         </style>
-        <script>
-        function filterByType() {
-            var t = document.getElementById('gtype').value;
-            document.querySelectorAll('.prod').forEach(function(p){
-                var thisType = p.getAttribute('data-gtype');
-                p.style.display = (!t || t=='all' || thisType==t) ? '' : 'none';
-            });
-        }
-        function showEdit(id) {
-            document.getElementById("editbox_" + id).style.display = "";
-        }
-        function hideEdit(id) {
-            document.getElementById("editbox_" + id).style.display = "none";
-        }
-        function updateFromProfit(id, costId, retailId, profitId, percentId) {
-            let cost = parseFloat(document.getElementById(costId).textContent);
-            let profit = parseFloat(document.getElementById(profitId).value);
-            let retail = cost + profit;
-            document.getElementById(retailId).value = retail.toFixed(2);
-            let percent = (profit / retail) * 100;
-            document.getElementById(percentId).value = isFinite(percent) ? Math.round(percent) : 0;
-        }
-        function updateFromPercent(id, costId, retailId, profitId, percentId) {
-            let cost = parseFloat(document.getElementById(costId).textContent);
-            let percent = parseFloat(document.getElementById(percentId).value);
-            let retail = cost / (1 - percent/100);
-            let profit = retail - cost;
-            document.getElementById(retailId).value = retail.toFixed(2);
-            document.getElementById(profitId).value = profit.toFixed(2);
-        }
-        function updateFromRetail(id, costId, retailId, profitId, percentId) {
-            let cost = parseFloat(document.getElementById(costId).textContent);
-            let retail = parseFloat(document.getElementById(retailId).value);
-            let profit = retail - cost;
-            let percent = (profit / retail) * 100;
-            document.getElementById(profitId).value = profit.toFixed(2);
-            document.getElementById(percentId).value = isFinite(percent) ? Math.round(percent) : 0;
-        }
-        </script>
     </head>
     <body>
         <h1>Printify Product Price Breakdown</h1>
-        {% if msg %}
-            <div style="padding:1em; background:#dff0d8; color:#3c763d; margin-bottom:1em; border-radius:8px;">{{ msg }}</div>
-        {% endif %}
+        <div id="job-flash-messages">
+            {% set has_msg = false %}
+            {% for category, msg in messages %}
+                {% if category == 'success' or category == 'error' %}
+                    {% if not has_msg %}
+                        {% set has_msg = true %}
+                    {% endif %}
+                    <div class="flash-{{category}}">{{ msg|safe }}</div>
+                {% endif %}
+            {% endfor %}
+            {% if has_msg %}
+                <button id="close-job-msg" title="Hide Results">&times;</button>
+            {% endif %}
+        </div>
         <div id="filter-wrap">
             <label for="gtype" style="font-weight:bold;">Filter by garment type: </label>
-            <select id="gtype" onchange="filterByType()">
+            <select id="gtype">
                 <option value="all">All</option>
                 {% for g in found_types %}
                 <option value="{{g}}">{{g}}</option>
                 {% endfor %}
             </select>
+            &nbsp; <label><input type="checkbox" id="select-all-cb"> Select All Visible</label>
         </div>
+        <form id="bulk-edit-bar" method="POST" action="{{ url_for('bulk_edit') }}">
+            <span><b>Bulk edit <span id="bulk_count">0</span> selected items</b></span>
+            <input type="hidden" name="product_ids" id="bulk_products" value="">
+            &nbsp; &nbsp;
+            <span class="editlabel">Retail:</span>
+            $<input type="number" step="0.01" min="0" name="retail_val" id="bulk_retail" value="" style="width:80px;">
+            &nbsp;&nbsp; <b>or</b> &nbsp;&nbsp;
+            <span class="editlabel">Profit:</span>
+            $<input type="number" step="0.01" min="0" name="profit_val" id="bulk_profit" value="" style="width:80px;">
+            &nbsp;&nbsp; <b>or</b> &nbsp;&nbsp;
+            <span class="editlabel">Margin %:</span>
+            <input type="number" step="1" min="0" max="99" name="percent_val" id="bulk_percent" value="" style="width:60px;">
+            &nbsp;&nbsp;
+            <button type="submit">Save All</button>
+            <button type="button" id="bulk-cancel">Cancel</button>
+            <div style="margin-top:0.5em;color:#ccc;font-size:0.96em;">
+                Set a retail price (all other variants follow margin), a profit (adds $ to each cost), <b>or</b> a margin percentage (profit relative to cost).<br>
+                All variants for each product will update accordingly.
+            </div>
+        </form>
         {% for p in products %}
         <div class="prod" data-gtype="{{p.garment_type}}">
+            <input class="select-checkbox" type="checkbox" value="{{p.id}}">
             <div style="display: flex; align-items: center; gap: 1em;">
                 {% if p.images and p.images[0] %}
                 <img src="{{ p.images[0].src }}">
@@ -168,6 +225,7 @@ def index():
                 </thead>
                 <tbody>
                     {% for v in p.variants %}
+                    {% if v %}
                     {% set prof = v.price - v.cost %}
                     {% if v.price > 0 %}
                         {% set percent = ((prof / v.price) * 100) | round %}
@@ -195,87 +253,399 @@ def index():
                             </span>
                         </td>
                         <td class="edit-icons">
-                            <button onclick="showEdit('{{v.id}}')" title="Edit price/profit/margin">&#9998;</button>
+                            <button onclick="showEdit('{{p.id}}')" title="Edit all variants">&#9998;</button>
                         </td>
                     </tr>
-                    <tr id="editbox_{{v.id}}" class="editbox" style="display:none;">
+                    <tr id="editbox_{{p.id}}" class="editbox" style="display:none;">
                         <td colspan="6">
-                            <form class="editform" method="POST" action="{{ url_for('edit_price') }}">
+                            <form class="editform" method="POST" action="{{ url_for('edit_price_all') }}">
                                 <input type="hidden" name="product_id" value="{{p.id}}">
                                 <input type="hidden" name="variant_id" value="{{v.id}}">
                                 <span class="editlabel">Retail:</span>
-                                $<input type="number" step="0.01" min="0" name="new_price" id="retail_{{v.id}}"
+                                $<input type="number" step="0.01" min="0" name="new_price" id="retail_{{p.id}}"
                                     value="{{ '%.2f' % (v.price / 100) }}"
-                                    oninput="updateFromRetail('{{v.id}}','cost_{{v.id}}','retail_{{v.id}}','profit_{{v.id}}','percent_{{v.id}}')">
+                                    oninput="updateFromRetail('{{p.id}}','cost_{{v.id}}','retail_{{p.id}}','profit_{{p.id}}','percent_{{p.id}}')">
                                 &nbsp; &nbsp;
                                 <span class="editlabel">Profit:</span>
-                                $<input type="number" step="0.01" min="0" id="profit_{{v.id}}"
+                                $<input type="number" step="0.01" min="0" name="profit_val" id="profit_{{p.id}}"
                                     value="{{ '%.2f' % ((v.price - v.cost) / 100) }}"
-                                    oninput="updateFromProfit('{{v.id}}','cost_{{v.id}}','retail_{{v.id}}','profit_{{v.id}}','percent_{{v.id}}')">
+                                    oninput="updateFromProfit('{{p.id}}','cost_{{v.id}}','retail_{{p.id}}','profit_{{p.id}}','percent_{{p.id}}')">
                                 &nbsp; &nbsp;
                                 <span class="editlabel">Margin %:</span>
-                                <input type="number" step="1" min="0" max="99" id="percent_{{v.id}}"
+                                <input type="number" step="1" min="0" max="99" name="percent_val" id="percent_{{p.id}}"
                                     value="{% if v.price > 0 %}{{ ((v.price-v.cost)/v.price*100)|round }}{% else %}0{% endif %}"
-                                    oninput="updateFromPercent('{{v.id}}','cost_{{v.id}}','retail_{{v.id}}','profit_{{v.id}}','percent_{{v.id}}')">
+                                    oninput="updateFromPercent('{{p.id}}','cost_{{v.id}}','retail_{{p.id}}','profit_{{p.id}}','percent_{{p.id}}')">
                                 &nbsp; &nbsp;
                                 <button type="submit">Save</button>
-                                <button type="button" onclick="hideEdit('{{v.id}}')">Cancel</button>
+                                <button type="button" onclick="hideEdit('{{p.id}}')">Cancel</button>
                                 <br>
-                                <span style="font-size:0.93em;color:#888;">Retail price is what is updated in Printify. You can set by any value; the rest will auto-calculate.</span>
+                                <span style="font-size:0.93em;color:#888;">
+                                    <b>When saving, all variants will be updated:</b><br>
+                                    • If you changed retail, all variants will update using that margin.<br>
+                                    • If you changed profit, all will get that profit added to their cost.<br>
+                                    • If you changed margin %, all will be priced for that margin.<br>
+                                    (The field you changed most will be used.)
+                                </span>
                             </form>
                         </td>
                     </tr>
+                    {% endif %}
                     {% endfor %}
                 </tbody>
             </table>
         </div>
         {% endfor %}
         <script>
-        filterByType();
+        let selectedProducts = [];
+        function updateBulkBar() {
+            let bar = document.getElementById("bulk-edit-bar");
+            if (selectedProducts.length > 0) {
+                bar.style.display = 'block';
+            } else {
+                bar.style.display = 'none';
+                document.getElementById("bulk_retail").value = "";
+                document.getElementById("bulk_profit").value = "";
+                document.getElementById("bulk_percent").value = "";
+            }
+            document.getElementById("bulk_count").innerText = selectedProducts.length;
+            document.getElementById("bulk_products").value = selectedProducts.join(",");
+        }
+        function toggleProduct(id, checked) {
+            if (checked) {
+                if (!selectedProducts.includes(id)) selectedProducts.push(id);
+            } else {
+                selectedProducts = selectedProducts.filter(pid => pid !== id);
+            }
+            updateBulkBar();
+        }
+        function selectAllVisible(checked) {
+            let products = document.querySelectorAll('.prod');
+            products.forEach(prod => {
+                if(prod.style.display !== "none") {
+                    let cb = prod.querySelector('.select-checkbox');
+                    cb.checked = checked;
+                    toggleProduct(cb.value, checked);
+                }
+            });
+        }
+        function clearSelections() {
+            selectedProducts = [];
+            document.querySelectorAll('.select-checkbox').forEach(cb=>{ cb.checked=false; });
+            updateBulkBar();
+        }
+        function onFilterChanged() {
+            clearSelections();
+        }
+        function filterByType() {
+            var t = document.getElementById('gtype').value;
+            document.querySelectorAll('.prod').forEach(function(p){
+                var thisType = p.getAttribute('data-gtype');
+                p.style.display = (!t || t=='all' || thisType==t) ? '' : 'none';
+            });
+        }
+        function showEdit(id) { document.getElementById("editbox_" + id).style.display = ""; }
+        function hideEdit(id) { document.getElementById("editbox_" + id).style.display = "none"; }
+        function updateFromProfit(id, costId, retailId, profitId, percentId) {
+            let cost = parseFloat(document.getElementById(costId).textContent);
+            let profit = parseFloat(document.getElementById(profitId).value);
+            let retail = cost + profit;
+            document.getElementById(retailId).value = retail.toFixed(2);
+            let percent = (profit / retail) * 100;
+            document.getElementById(percentId).value = isFinite(percent) ? Math.round(percent) : 0;
+        }
+        function updateFromPercent(id, costId, retailId, profitId, percentId) {
+            let cost = parseFloat(document.getElementById(costId).textContent);
+            let percent = parseFloat(document.getElementById(percentId).value);
+            let retail = cost / (1 - percent/100);
+            let profit = retail - cost;
+            document.getElementById(retailId).value = retail.toFixed(2);
+            document.getElementById(profitId).value = profit.toFixed(2);
+        }
+        function updateFromRetail(id, costId, retailId, profitId, percentId) {
+            let cost = parseFloat(document.getElementById(costId).textContent);
+            let retail = parseFloat(document.getElementById(retailId).value);
+            let profit = retail - cost;
+            let percent = (profit / retail) * 100;
+            document.getElementById(profitId).value = profit.toFixed(2);
+            document.getElementById(percentId).value = isFinite(percent) ? Math.round(percent) : 0;
+        }
+        document.addEventListener("DOMContentLoaded", function() {
+            document.getElementById("gtype").addEventListener("change", function(){
+                filterByType();
+                clearSelections();
+            });
+            document.getElementById("select-all-cb").addEventListener("change", function() {
+                selectAllVisible(this.checked);
+            });
+            document.getElementById("bulk-cancel").addEventListener("click", function() {
+                clearSelections();
+            });
+            document.querySelectorAll('.select-checkbox').forEach(cb=>{
+                cb.addEventListener("change", function() {
+                    toggleProduct(cb.value, cb.checked);
+                });
+            });
+            filterByType();
+            updateBulkBar();
+            let closeBtn = document.getElementById('close-job-msg');
+            if (closeBtn) {
+                closeBtn.addEventListener('click', function() {
+                    document.getElementById('job-flash-messages').style.display = 'none';
+                });
+            }
+        });
         </script>
     </body>
-    </html>
-    '''
-    return render_template_string(html, products=detailed, found_types=found_types, msg=msg)
+    </html>'''
+    return render_template_string(html, products=detailed, found_types=found_types, messages=messages)
 
-@app.route("/edit_price", methods=["POST"])
-def edit_price():
-    product_id = request.form.get("product_id")
-    variant_id = request.form.get("variant_id")
-    new_price = request.form.get("new_price")
+@app.route("/bulk_edit", methods=["POST"])
+def bulk_edit():
+    product_ids = request.form.get("product_ids", "")
+    retail_val = request.form.get("retail_val", "").strip()
+    profit_val = request.form.get("profit_val", "").strip()
+    percent_val = request.form.get("percent_val", "").strip()
+    if not product_ids:
+        flash("No products selected.", "error")
+        return redirect(url_for("index"))
+    ids = [pid for pid in product_ids.split(",") if pid]
     try:
-        shop_id, _, _ = get_shop_and_products()
+        shop_id, detailed, _ = get_shop_and_products()
     except Exception as e:
-        return str(e), 400
-    if not (product_id and variant_id and new_price):
-        return redirect(url_for("index", msg="Missing required info."))
+        flash(str(e), "error")
+        return redirect(url_for("index"))
+    product_lookup = {str(p['id']): p.get('title', str(p['id'])) for p in detailed}
+    # Only one edit mode can be used at a time
+    set_count = sum(1 for x in [retail_val, profit_val, percent_val] if x)
+    if set_count != 1:
+        flash("Set either Retail, Profit, or Margin %, not more than one.", "error")
+        return redirect(url_for("index"))
+    summary_lines = []
+    for pid in ids:
+        if retail_val:
+            resp, variants, updated = update_all_prices_bulk_retail(pid, shop_id, float(retail_val))
+            msg_title = f"Set default variant to retail: ${float(retail_val):.2f} (others follow margin %)"
+        else:
+            # Original behavior for profit and percent
+            mode = None
+            value = None
+            if profit_val:
+                try:
+                    value = float(profit_val)
+                    mode = "profit"
+                except Exception:
+                    flash("Invalid profit value.", "error")
+                    return redirect(url_for("index"))
+            elif percent_val:
+                try:
+                    value = float(percent_val)
+                    if value >= 100:
+                        flash("Margin percent must be <100%.", "error")
+                        return redirect(url_for("index"))
+                    mode = "percent"
+                except Exception:
+                    flash("Invalid percent value.", "error")
+                    return redirect(url_for("index"))
+            resp, variants, updated = update_all_prices_bulk_retail(pid, shop_id, None)
+            if mode == "profit":
+                # Overwrite prices for all variants
+                updated = []
+                for v in variants:
+                    cost = v.get("cost", 0) / 100
+                    price = cost + value
+                    updated.append({
+                        "id": v["id"],
+                        "price": int(round(price * 100)),
+                        "is_enabled": v.get("is_enabled", True),
+                        "is_visible": v.get("is_visible", True)
+                    })
+                patch_url = f"https://api.printify.com/v1/shops/{shop_id}/products/{pid}.json"
+                payload = {"variants": updated}
+                resp = requests.put(
+                    patch_url,
+                    headers={
+                        "Authorization": f"Bearer {API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json=payload
+                )
+                msg_title = f"Set all variants to profit: ${value:.2f}"
+            elif mode == "percent":
+                updated = []
+                margin = value / 100.0
+                for v in variants:
+                    cost = v.get("cost", 0) / 100
+                    price = cost / (1 - margin) if margin < 1.0 else cost
+                    updated.append({
+                        "id": v["id"],
+                        "price": int(round(price * 100)),
+                        "is_enabled": v.get("is_enabled", True),
+                        "is_visible": v.get("is_visible", True)
+                    })
+                patch_url = f"https://api.printify.com/v1/shops/{shop_id}/products/{pid}.json"
+                payload = {"variants": updated}
+                resp = requests.put(
+                    patch_url,
+                    headers={
+                        "Authorization": f"Bearer {API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json=payload
+                )
+                msg_title = f"Set all variants to margin: {round(value)}%"
+        product_title = product_lookup.get(str(pid), str(pid))
+        if resp is None or resp.status_code != 200:
+            try:
+                err = resp.json()
+                if isinstance(err, dict) and err.get('code') == 8251:
+                    reason = err.get("errors", {}).get("reason", "")
+                    summary_lines.append(
+                        f"<b>{product_title} ({pid}): Failed to update:</b> {reason} "
+                        "<br><span style='color:#c00;'>You likely have >100 enabled variants (may include hidden/archived). Disable some in Printify, then try again.</span><br>"
+                    )
+                    continue
+            except Exception:
+                err = resp.text if resp is not None else "Unknown error"
+            summary_lines.append(f"<b>{product_title} ({pid}): Failed to update:</b> {err}<br>")
+            continue
+        confirm_rows = []
+        for v in variants:
+            new_row = next((u for u in updated if u["id"] == v["id"]), None)
+            if new_row:
+                cost = v.get("cost", 0) / 100
+                price = new_row["price"] / 100
+                profitx = price - cost
+                marginx = (profitx / price * 100) if price > 0 else 0
+                confirm_rows.append(
+                    f"<tr class='updated-row'><td>{', '.join(str(x) for x in v.get('options', []))}</td>"
+                    f"<td>${price:.2f}</td>"
+                    f"<td>${cost:.2f}</td>"
+                    f"<td>${profitx:.2f}</td>"
+                    f"<td>{round(marginx)}%</td></tr>"
+                )
+        summary_lines.append(
+            f"<b>{msg_title}</b><br>"
+            f"<b>{product_title} (Product ID: {pid})</b><br>"
+            "<div class='scroll-table'><table style='width:100%;background:#f8fff8;'>"
+            "<tr><th>Variant</th><th>Retail</th><th>Cost</th><th>Profit</th><th>Margin %</th></tr>"
+            + "".join(confirm_rows) + "</table></div>"
+        )
+    flash("<br>".join(summary_lines), "success")
+    return redirect(url_for("index"))
 
+@app.route("/edit_price_all", methods=["POST"])
+def edit_price_all():
+    product_id = request.form.get("product_id")
+    new_price = request.form.get("new_price")
+    profit_val = request.form.get("profit_val")
+    percent_val = request.form.get("percent_val")
     try:
-        price_cents = int(round(float(new_price) * 100))
+        shop_id, detailed, _ = get_shop_and_products()
+    except Exception as e:
+        flash(str(e), "error")
+        return redirect(url_for("index"))
+    main_variant = get_all_variants(product_id, shop_id)[0]
+    old_retail = main_variant.get("price", 0) / 100
+    old_cost = main_variant.get("cost", 0) / 100
+    old_profit = old_retail - old_cost
+    old_percent = (old_profit / old_retail * 100) if old_retail > 0 else 0
+    try:
+        new_retail = float(new_price)
+        new_profit = float(profit_val)
+        new_percent = float(percent_val)
     except Exception:
-        return redirect(url_for("index", msg="Invalid price."))
-
-    patch_url = f"https://api.printify.com/v1/shops/{shop_id}/products/{product_id}.json"
-    payload = {
-        "variants": [
-            {"id": int(variant_id), "price": price_cents}
-        ]
-    }
-    resp = requests.patch(
-        patch_url,
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json"
-        },
-        json=payload
-    )
-    if resp.status_code != 200:
+        flash("Invalid field values.", "error")
+        return redirect(url_for("index"))
+    diff_retail = abs(new_retail - old_retail)
+    diff_profit = abs(new_profit - old_profit)
+    diff_percent = abs(new_percent - old_percent)
+    if diff_retail >= diff_profit and diff_retail >= diff_percent:
+        # Use the new bulk retail logic here as well!
+        resp, variants, updated = update_all_prices_bulk_retail(product_id, shop_id, new_retail)
+        msg_title = f"Set default variant to retail: ${new_retail:.2f} (others follow margin %)"
+    elif diff_profit >= diff_retail and diff_profit >= diff_percent:
+        value = new_profit
+        mode = "profit"
+        updated = []
+        variants = get_all_variants(product_id, shop_id)
+        for v in variants:
+            cost = v.get("cost", 0) / 100
+            price = cost + value
+            updated.append({
+                "id": v["id"],
+                "price": int(round(price * 100)),
+                "is_enabled": v.get("is_enabled", True),
+                "is_visible": v.get("is_visible", True)
+            })
+        patch_url = f"https://api.printify.com/v1/shops/{shop_id}/products/{product_id}.json"
+        payload = {"variants": updated}
+        resp = requests.put(
+            patch_url,
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json=payload
+        )
+        msg_title = f"Set all variants to profit: ${value:.2f}"
+    else:
+        value = new_percent
+        mode = "percent"
+        updated = []
+        margin = value / 100.0
+        variants = get_all_variants(product_id, shop_id)
+        for v in variants:
+            cost = v.get("cost", 0) / 100
+            price = cost / (1 - margin) if margin < 1.0 else cost
+            updated.append({
+                "id": v["id"],
+                "price": int(round(price * 100)),
+                "is_enabled": v.get("is_enabled", True),
+                "is_visible": v.get("is_visible", True)
+            })
+        patch_url = f"https://api.printify.com/v1/shops/{shop_id}/products/{product_id}.json"
+        payload = {"variants": updated}
+        resp = requests.put(
+            patch_url,
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json=payload
+        )
+        msg_title = f"Set all variants to margin: {round(value)}%"
+    if resp is None or resp.status_code != 200:
         try:
             err = resp.json()
         except Exception:
             err = resp.text
-        return redirect(url_for("index", msg=f"Failed to update price: {err}"))
-    return redirect(url_for("index", msg=f"Retail price updated to ${float(new_price):.2f} for product/variant {product_id}/{variant_id}. This does NOT publish the product."))
+        flash(f"Failed to update: {err}", "error")
+        return redirect(url_for("index"))
+    confirm_rows = []
+    variants = get_all_variants(product_id, shop_id)
+    for v in variants:
+        new_row = next((u for u in updated if u["id"] == v["id"]), None)
+        if new_row:
+            cost = v.get("cost", 0) / 100
+            price = new_row["price"] / 100
+            profit = price - cost
+            margin = (profit / price * 100) if price > 0 else 0
+            confirm_rows.append(
+                f"<tr class='updated-row'><td>{', '.join(str(x) for x in v.get('options', []))}</td>"
+                f"<td>${price:.2f}</td>"
+                f"<td>${cost:.2f}</td>"
+                f"<td>${profit:.2f}</td>"
+                f"<td>{round(margin)}%</td></tr>"
+            )
+    table = (
+        f"<b>{msg_title}</b><br>"
+        "<b>All variants updated. Changes are in Printify, not yet published in your store.</b>"
+        "<div class='scroll-table'><table style='width:100%;background:#f8fff8;'>"
+        "<tr><th>Variant</th><th>Retail</th><th>Cost</th><th>Profit</th><th>Margin %</th></tr>"
+        + "".join(confirm_rows) + "</table></div>"
+    )
+    flash(table, "success")
+    return redirect(url_for("index"))
 
 if __name__ == "__main__":
     app.run(port=5000, debug=True)

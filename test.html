@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        #bulk-edit-bar {display:none; margin-bottom: 2em; background: #222; color: #fff; padding: 1.2em 1.2em 0.9em 1.2em; border-radius: 1em; box-shadow: 0 2px 16px #0005;}
+    </style>
+</head>
+<body>
+    <form id="bulk-edit-bar">
+        <span><b>Bulk edit <span id="bulk_count">0</span> selected items</b></span>
+        <input type="hidden" id="bulk_products" value="">
+        <button type="button" id="bulk-cancel">Cancel</button>
+    </form>
+
+    <div>
+        <input class="select-checkbox" type="checkbox" value="prod1"> Product 1<br>
+        <input class="select-checkbox" type="checkbox" value="prod2"> Product 2<br>
+        <input class="select-checkbox" type="checkbox" value="prod3"> Product 3<br>
+    </div>
+    <script>
+    let selectedProducts = [];
+    function updateBulkBar() {
+        let bar = document.getElementById("bulk-edit-bar");
+        if (selectedProducts.length > 0) {
+            bar.style.display = '';
+        } else {
+            bar.style.display = 'none';
+        }
+        document.getElementById("bulk_count").innerText = selectedProducts.length;
+        document.getElementById("bulk_products").value = selectedProducts.join(",");
+    }
+    function toggleProduct(id, checked) {
+        if (checked) {
+            if (!selectedProducts.includes(id)) selectedProducts.push(id);
+        } else {
+            selectedProducts = selectedProducts.filter(pid => pid !== id);
+        }
+        updateBulkBar();
+    }
+    document.querySelectorAll('.select-checkbox').forEach(cb=>{
+        cb.addEventListener("change", function() {
+            toggleProduct(cb.value, cb.checked);
+        });
+    });
+    document.getElementById("bulk-cancel").addEventListener("click", function() {
+        selectedProducts = [];
+        document.querySelectorAll('.select-checkbox').forEach(cb=>{ cb.checked=false; });
+        updateBulkBar();
+    });
+    </script>
+</body>
+</html>
