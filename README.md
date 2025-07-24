@@ -31,7 +31,7 @@ cd printify-price-manager
 Copy `.env-sample` to `.env` and set your credentials:
 
 ```sh
-cp .env.sample .env
+cp .env-sample .env
 ```
 
 Open `.env` and set:
