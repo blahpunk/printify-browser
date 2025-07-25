@@ -13,3 +13,5 @@ __pycache__/
 # macOS/Linux/Windows
 .DS_Store
 Thumbs.db
+
+blooops.py
