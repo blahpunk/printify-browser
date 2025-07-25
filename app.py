@@ -1,5 +1,4 @@
 import os
-import re
 import requests
 from flask import Flask, render_template_string, request, redirect, url_for, flash, get_flashed_messages
 from dotenv import load_dotenv
@@ -9,25 +8,25 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "not-so-secret")
 API_KEY = os.environ.get("PRINTIFY_API_KEY")
 
-GARMENT_TYPES = [
-    "All-Over Print Hoodie",
-    "Crewneck Sweatshirt",
-    "Art Tee",
-    "Pullover Art Hoodie",
-    "Lightweight Hooded Tee",
-    "All-over Print Tee",
-]
-
-# Session shipping cache (variant_id, country_code) -> shipping_cents
 shipping_cache = {}
 
-def extract_garment_type(title):
-    for gtype in GARMENT_TYPES:
-        if re.search(re.escape(gtype), title, re.IGNORECASE):
-            return gtype
-    return "Other"
+def get_blueprint_map():
+    """Fetch all blueprints from Printify and build an id → name dict."""
+    resp = requests.get(
+        "https://api.printify.com/v1/catalog/blueprints.json",
+        headers={"Authorization": f"Bearer {API_KEY}"}
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return {bp['id']: bp['title'] for bp in data}
+
+# Cache blueprint map for session
+BLUEPRINT_MAP = None
 
 def get_shop_and_products():
+    global BLUEPRINT_MAP
+    if BLUEPRINT_MAP is None:
+        BLUEPRINT_MAP = get_blueprint_map()
     shops = requests.get(
         "https://api.printify.com/v1/shops.json",
         headers={"Authorization": f"Bearer {API_KEY}"}
@@ -43,6 +42,7 @@ def get_shop_and_products():
     if not products:
         raise Exception("No products found for this shop.")
     detailed = []
+    used_blueprint_ids = set()
     for prod in products:
         prod_details = requests.get(
             f"https://api.printify.com/v1/shops/{shop_id}/products/{prod['id']}.json",
@@ -57,9 +57,18 @@ def get_shop_and_products():
         if not default_variant and variants:
             default_variant = variants[0]
         prod_details["variants"] = [default_variant] if default_variant else []
-        prod_details["garment_type"] = extract_garment_type(prod_details.get("title", ""))
+        prod_details["provider_id"] = prod_details.get("provider", {}).get("id") or (
+            default_variant.get("provider_id") if default_variant else None
+        )
+        prod_details["print_area_key"] = default_variant.get("print_area_key") if default_variant else None
+        blueprint_id = prod_details.get("blueprint_id")
+        garment_type = BLUEPRINT_MAP.get(blueprint_id, f"Blueprint {blueprint_id}")
+        prod_details["garment_type"] = garment_type
+        prod_details["type_display"] = garment_type
+        used_blueprint_ids.add(blueprint_id)
         detailed.append(prod_details)
-    found_types = sorted({p["garment_type"] for p in detailed if p["garment_type"] in GARMENT_TYPES})
+    # Only offer types actually in use in this shop
+    found_types = sorted({p["garment_type"] for p in detailed})
     return shop_id, detailed, found_types
 
 def get_all_variants(product_id, shop_id):
@@ -70,14 +79,17 @@ def get_all_variants(product_id, shop_id):
     prod = r.json()
     return prod.get("variants", [])
 
-def get_variant_shipping_cost(variant_id, country_code="US"):
-    if not variant_id:
-        return None
-    key = (variant_id, country_code)
+def get_variant_shipping_cost(provider_id, print_area_key, country_code="US"):
+    key = (provider_id, print_area_key, country_code)
     if key in shipping_cache:
         return shipping_cache[key]
-    url = f"https://api.printify.com/v1/shipping.json?country={country_code}&variant_id={variant_id}"
-    resp = requests.get(url, headers={"Authorization": f"Bearer {API_KEY}"})
+    if not provider_id or not print_area_key:
+        return None
+    url = f"https://api.printify.com/v1/shipping.json?country={country_code}&provider_id={provider_id}&print_area_key={print_area_key}"
+    resp = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {API_KEY}"}
+    )
     if resp.status_code == 200:
         data = resp.json()
         if "standard" in data:
@@ -132,12 +144,6 @@ def index():
         shop_id, detailed, found_types = get_shop_and_products()
     except Exception as e:
         return str(e), 400
-
-    # Attach shipping cost per variant (default only for this UI)
-    for prod in detailed:
-        for v in prod["variants"]:
-            if v:
-                v["shipping_cost"] = get_variant_shipping_cost(v.get("id"))
 
     html = '''<!DOCTYPE html>
     <html>
@@ -194,7 +200,7 @@ def index():
             {% endif %}
         </div>
         <div id="filter-wrap">
-            <label for="gtype" style="font-weight:bold;">Filter by garment type: </label>
+            <label for="gtype" style="font-weight:bold;">Filter by product type: </label>
             <select id="gtype">
                 <option value="all">All</option>
                 {% for g in found_types %}
@@ -235,7 +241,7 @@ def index():
                     <div style="color:#888;">{{ p.vendor }}</div>
                 </div>
             </div>
-            <div style="color:#666; font-size: 0.9em; margin-top: 0.5em;">Type: <b>{{p.garment_type}}</b></div>
+            <div style="color:#666; font-size: 0.9em; margin-top: 0.5em;">Type: <b>{{p.type_display}}</b></div>
             <table>
                 <thead>
                     <tr>
@@ -278,8 +284,13 @@ def index():
                             </span>
                         </td>
                         <td>
-                            {% if v.shipping_cost is not none %}
-                                ${{ '%.2f' % (v.shipping_cost / 100) }}
+                            {% set shipping_cost = None %}
+                            {% if p.provider_id and p.print_area_key %}
+                                {% set shipping_cost = namespace(val=None) %}
+                                {% set _ = shipping_cost.update({'val': v.get('shipping_cost')}) %}
+                            {% endif %}
+                            {% if shipping_cost and shipping_cost.val %}
+                                ${{ '%.2f' % (shipping_cost.val / 100) }}
                             {% else %}
                                 N/A
                             {% endif %}
@@ -426,7 +437,17 @@ def index():
         </script>
     </body>
     </html>'''
+    # Attach shipping cost per variant (only for default variant)
+    for prod in detailed:
+        for v in prod["variants"]:
+            if v:
+                provider_id = prod.get("provider_id")
+                print_area_key = prod.get("print_area_key")
+                v["shipping_cost"] = get_variant_shipping_cost(provider_id, print_area_key)
     return render_template_string(html, products=detailed, found_types=found_types, messages=messages)
+
+# bulk_edit and edit_price_all endpoints remain unchanged
+
 
 
 @app.route("/bulk_edit", methods=["POST"])
@@ -445,7 +466,6 @@ def bulk_edit():
         flash(str(e), "error")
         return redirect(url_for("index"))
     product_lookup = {str(p['id']): p.get('title', str(p['id'])) for p in detailed}
-    # Only one edit mode can be used at a time
     set_count = sum(1 for x in [retail_val, profit_val, percent_val] if x)
     if set_count != 1:
         flash("Set either Retail, Profit, or Margin %, not more than one.", "error")
@@ -456,7 +476,6 @@ def bulk_edit():
             resp, variants, updated = update_all_prices_bulk_retail(pid, shop_id, float(retail_val))
             msg_title = f"Set default variant to retail: ${float(retail_val):.2f} (others follow margin %)"
         else:
-            # Original behavior for profit and percent
             mode = None
             value = None
             if profit_val:
@@ -478,7 +497,6 @@ def bulk_edit():
                     return redirect(url_for("index"))
             resp, variants, updated = update_all_prices_bulk_retail(pid, shop_id, None)
             if mode == "profit":
-                # Overwrite prices for all variants
                 updated = []
                 for v in variants:
                     cost = v.get("cost", 0) / 100
@@ -590,12 +608,10 @@ def edit_price_all():
     diff_profit = abs(new_profit - old_profit)
     diff_percent = abs(new_percent - old_percent)
     if diff_retail >= diff_profit and diff_retail >= diff_percent:
-        # Use the new bulk retail logic here as well!
         resp, variants, updated = update_all_prices_bulk_retail(product_id, shop_id, new_retail)
         msg_title = f"Set default variant to retail: ${new_retail:.2f} (others follow margin %)"
     elif diff_profit >= diff_retail and diff_profit >= diff_percent:
         value = new_profit
-        mode = "profit"
         updated = []
         variants = get_all_variants(product_id, shop_id)
         for v in variants:
@@ -620,7 +636,6 @@ def edit_price_all():
         msg_title = f"Set all variants to profit: ${value:.2f}"
     else:
         value = new_percent
-        mode = "percent"
         updated = []
         margin = value / 100.0
         variants = get_all_variants(product_id, shop_id)
