@@ -97,7 +97,7 @@ You’ll see a dashboard showing your products, prices, and detected product typ
 
 ## Screenshots
 
-![App Screenshot](screenshots/Screenshot_2025-07-24_16-50-43.png)
+![App Screenshot](screenshots/Screenshot_2025-07-24_22-27-24.png)
 
 ---
 
