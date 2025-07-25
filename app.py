@@ -23,6 +23,20 @@ def get_blueprint_map():
 # Cache blueprint map for session
 BLUEPRINT_MAP = None
 
+def get_human_readable_size(variant, product_options):
+    """Map variant.options (list of IDs) to human-readable size using product options metadata."""
+    if not variant or "options" not in variant or not product_options:
+        return "N/A"
+    options = variant["options"]
+    for idx, opt_meta in enumerate(product_options):
+        # Accept both "type": "size" and "name" containing "size"
+        if (opt_meta.get("type") == "size" or "size" in opt_meta.get("name", "").lower()) and idx < len(options):
+            size_id = options[idx]
+            for v in opt_meta.get("values", []):
+                if v.get("id") == size_id:
+                    return v.get("title", str(size_id))
+    return "N/A"
+
 def get_shop_and_products():
     global BLUEPRINT_MAP
     if BLUEPRINT_MAP is None:
@@ -48,14 +62,31 @@ def get_shop_and_products():
             f"https://api.printify.com/v1/shops/{shop_id}/products/{prod['id']}.json",
             headers={"Authorization": f"Bearer {API_KEY}"}
         ).json()
+        product_options = prod_details.get("options", [])
         variants = prod_details.get("variants", [])
         default_variant = None
+        default_found = False
         for v in variants:
             if v.get("is_default"):
                 default_variant = v
+                default_found = True
                 break
         if not default_variant and variants:
             default_variant = variants[0]
+            default_found = False
+
+        # Get human-readable size label for the default variant
+        default_size = get_human_readable_size(default_variant, product_options)
+
+        if default_found:
+            print(f"[INFO] Product '{prod_details.get('title')}' — using variant '{default_variant.get('id')}' as DEFAULT (is_default=True, size={default_size}).")
+        elif default_variant:
+            print(f"[WARN] Product '{prod_details.get('title')}' — no variant marked is_default; using FIRST variant '{default_variant.get('id')}', size={default_size}.")
+        else:
+            print(f"[ERROR] Product '{prod_details.get('title')}' — no variants found!")
+
+        prod_details["default_size"] = default_size
+
         prod_details["variants"] = [default_variant] if default_variant else []
         prod_details["provider_id"] = prod_details.get("provider", {}).get("id") or (
             default_variant.get("provider_id") if default_variant else None
@@ -67,9 +98,9 @@ def get_shop_and_products():
         prod_details["type_display"] = garment_type
         used_blueprint_ids.add(blueprint_id)
         detailed.append(prod_details)
-    # Only offer types actually in use in this shop
     found_types = sorted({p["garment_type"] for p in detailed})
     return shop_id, detailed, found_types
+
 
 def get_all_variants(product_id, shop_id):
     r = requests.get(
@@ -153,6 +184,7 @@ def index():
             body { font-family: sans-serif; margin: 2em; background: #f9f9fb;}
             .prod { background: #fff; border-radius: 14px; margin-bottom: 2em; padding: 1.5em; box-shadow: 0 2px 8px #0001; position: relative;}
             .prod h2 { margin: 0 0 0.5em; }
+            .default-size { font-size: 1em; font-weight: 600; color: #4c5799; margin-left: 0.5em;}
             table { width: 100%; border-collapse: collapse; table-layout: fixed;}
             th, td { padding: 0.4em 0.6em; text-align: center; vertical-align: middle;}
             th { background: #f0f0f7; }
@@ -237,7 +269,7 @@ def index():
                 <img src="{{ p.images[0].src }}">
                 {% endif %}
                 <div>
-                    <h2>{{ p.title }}</h2>
+                    <h2>{{ p.title }} <span class="default-size">(Default Size: {{ p.default_size }})</span></h2>
                     <div style="color:#888;">{{ p.vendor }}</div>
                 </div>
             </div>
@@ -339,6 +371,7 @@ def index():
         </div>
         {% endfor %}
         <script>
+        // (JS unchanged)
         let selectedProducts = [];
         function updateBulkBar() {
             let bar = document.getElementById("bulk-edit-bar");
@@ -447,8 +480,6 @@ def index():
     return render_template_string(html, products=detailed, found_types=found_types, messages=messages)
 
 # bulk_edit and edit_price_all endpoints remain unchanged
-
-
 
 @app.route("/bulk_edit", methods=["POST"])
 def bulk_edit():
