@@ -1,6 +1,6 @@
 # Printify Product Price Manager
 
-![App Screenshot](screenshots/Screenshot_2025-07-24_22-27-24)
+![App Screenshot](screenshots/Screenshot_2025-07-24_22-27-24.png)
 
 A Flask-based web dashboard for viewing, filtering, and **bulk updating retail prices** of your Printify products with instant feedback and live product-type filtering.
 Supports price updates by retail, margin %, or profit—while preserving your product/variant setup in Printify. Designed for efficiency and quick oversight of all your store’s key garments.
