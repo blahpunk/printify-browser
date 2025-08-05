@@ -506,27 +506,70 @@ def bulk_edit():
         if retail_val:
             resp, variants, updated = update_all_prices_bulk_retail(pid, shop_id, float(retail_val))
             msg_title = f"Set default variant to retail: ${float(retail_val):.2f} (others follow margin %)"
+        elif profit_val:
+            try:
+                value = float(profit_val)
+            except Exception:
+                flash("Invalid profit value.", "error")
+                return redirect(url_for("index"))
+            variants = get_all_variants(pid, shop_id)
+            updated = []
+            for v in variants:
+                cost = v.get("cost", 0) / 100
+                price = cost + value
+                updated.append({
+                    "id": v["id"],
+                    "price": int(round(price * 100)),
+                    "is_enabled": v.get("is_enabled", True),
+                    "is_visible": v.get("is_visible", True)
+                })
+            patch_url = f"https://api.printify.com/v1/shops/{shop_id}/products/{pid}.json"
+            payload = {"variants": updated}
+            resp = requests.put(
+                patch_url,
+                headers={
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json=payload
+            )
+            msg_title = f"Set all variants to profit: ${value:.2f}"
+        elif percent_val:
+            try:
+                value = float(percent_val)
+                if value >= 100:
+                    flash("Margin percent must be <100%.", "error")
+                    return redirect(url_for("index"))
+            except Exception:
+                flash("Invalid percent value.", "error")
+                return redirect(url_for("index"))
+            variants = get_all_variants(pid, shop_id)
+            updated = []
+            margin = value / 100.0
+            for v in variants:
+                cost = v.get("cost", 0) / 100
+                price = cost / (1 - margin) if margin < 1.0 else cost
+                updated.append({
+                    "id": v["id"],
+                    "price": int(round(price * 100)),
+                    "is_enabled": v.get("is_enabled", True),
+                    "is_visible": v.get("is_visible", True)
+                })
+            patch_url = f"https://api.printify.com/v1/shops/{shop_id}/products/{pid}.json"
+            payload = {"variants": updated}
+            resp = requests.put(
+                patch_url,
+                headers={
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json=payload
+            )
+            msg_title = f"Set all variants to margin: {round(value)}%"
         else:
-            mode = None
-            value = None
-            if profit_val:
-                try:
-                    value = float(profit_val)
-                    mode = "profit"
-                except Exception:
-                    flash("Invalid profit value.", "error")
-                    return redirect(url_for("index"))
-            elif percent_val:
-                try:
-                    value = float(percent_val)
-                    if value >= 100:
-                        flash("Margin percent must be <100%.", "error")
-                        return redirect(url_for("index"))
-                    mode = "percent"
-                except Exception:
-                    flash("Invalid percent value.", "error")
-                    return redirect(url_for("index"))
-            resp, variants, updated = update_all_prices_bulk_retail(pid, shop_id, None)
+            flash("No pricing field set.", "error")
+            return redirect(url_for("index"))
+
             if mode == "profit":
                 updated = []
                 for v in variants:
