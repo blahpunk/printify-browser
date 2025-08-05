@@ -11,7 +11,6 @@ API_KEY = os.environ.get("PRINTIFY_API_KEY")
 shipping_cache = {}
 
 def get_blueprint_map():
-    """Fetch all blueprints from Printify and build an id → name dict."""
     resp = requests.get(
         "https://api.printify.com/v1/catalog/blueprints.json",
         headers={"Authorization": f"Bearer {API_KEY}"}
@@ -20,22 +19,31 @@ def get_blueprint_map():
     data = resp.json()
     return {bp['id']: bp['title'] for bp in data}
 
-# Cache blueprint map for session
 BLUEPRINT_MAP = None
 
 def get_human_readable_size(variant, product_options):
-    """Map variant.options (list of IDs) to human-readable size using product options metadata."""
     if not variant or "options" not in variant or not product_options:
         return "N/A"
     options = variant["options"]
     for idx, opt_meta in enumerate(product_options):
-        # Accept both "type": "size" and "name" containing "size"
         if (opt_meta.get("type") == "size" or "size" in opt_meta.get("name", "").lower()) and idx < len(options):
             size_id = options[idx]
             for v in opt_meta.get("values", []):
                 if v.get("id") == size_id:
                     return v.get("title", str(size_id))
     return "N/A"
+
+def get_large_variant(variants, product_options):
+    # Define accepted 'large' titles, case-insensitive
+    large_titles = {"large", "l"}
+    for v in variants:
+        size = get_human_readable_size(v, product_options)
+        if size and size.strip().lower() in large_titles:
+            return v
+    # Fallback: return first variant if no Large found
+    if variants:
+        return variants[0]
+    return None
 
 def get_shop_and_products():
     global BLUEPRINT_MAP
@@ -64,34 +72,21 @@ def get_shop_and_products():
         ).json()
         product_options = prod_details.get("options", [])
         variants = prod_details.get("variants", [])
-        default_variant = None
-        default_found = False
-        for v in variants:
-            if v.get("is_default"):
-                default_variant = v
-                default_found = True
-                break
-        if not default_variant and variants:
-            default_variant = variants[0]
-            default_found = False
-
-        # Get human-readable size label for the default variant
-        default_size = get_human_readable_size(default_variant, product_options)
-
-        if default_found:
-            print(f"[INFO] Product '{prod_details.get('title')}' — using variant '{default_variant.get('id')}' as DEFAULT (is_default=True, size={default_size}).")
-        elif default_variant:
-            print(f"[WARN] Product '{prod_details.get('title')}' — no variant marked is_default; using FIRST variant '{default_variant.get('id')}', size={default_size}.")
+        # Pick Large as the key variant for UI and margin calculations
+        large_variant = get_large_variant(variants, product_options)
+        large_size = get_human_readable_size(large_variant, product_options) if large_variant else "N/A"
+        if large_variant and large_size.lower() == "large":
+            print(f"[INFO] Product '{prod_details.get('title')}' — using variant '{large_variant.get('id')}' as KEY (Large, size={large_size}).")
+        elif large_variant:
+            print(f"[WARN] Product '{prod_details.get('title')}' — no Large variant; using FIRST variant '{large_variant.get('id')}', size={large_size}.")
         else:
             print(f"[ERROR] Product '{prod_details.get('title')}' — no variants found!")
-
-        prod_details["default_size"] = default_size
-
-        prod_details["variants"] = [default_variant] if default_variant else []
+        prod_details["default_size"] = large_size
+        prod_details["variants"] = [large_variant] if large_variant else []
         prod_details["provider_id"] = prod_details.get("provider", {}).get("id") or (
-            default_variant.get("provider_id") if default_variant else None
+            large_variant.get("provider_id") if large_variant else None
         )
-        prod_details["print_area_key"] = default_variant.get("print_area_key") if default_variant else None
+        prod_details["print_area_key"] = large_variant.get("print_area_key") if large_variant else None
         blueprint_id = prod_details.get("blueprint_id")
         garment_type = BLUEPRINT_MAP.get(blueprint_id, f"Blueprint {blueprint_id}")
         prod_details["garment_type"] = garment_type
@@ -100,7 +95,6 @@ def get_shop_and_products():
         detailed.append(prod_details)
     found_types = sorted({p["garment_type"] for p in detailed})
     return shop_id, detailed, found_types
-
 
 def get_all_variants(product_id, shop_id):
     r = requests.get(
@@ -131,31 +125,30 @@ def get_variant_shipping_cost(provider_id, print_area_key, country_code="US"):
     shipping_cache[key] = None
     return None
 
-def update_all_prices_bulk_retail(product_id, shop_id, target_retail):
-    variants = get_all_variants(product_id, shop_id)
-    if not variants:
+def update_all_prices_based_on_large(product_id, shop_id, target_retail):
+    prod_resp = requests.get(
+        f"https://api.printify.com/v1/shops/{shop_id}/products/{product_id}.json",
+        headers={"Authorization": f"Bearer {API_KEY}"}
+    )
+    prod_data = prod_resp.json()
+    product_options = prod_data.get("options", [])
+    variants = prod_data.get("variants", [])
+    large_variant = get_large_variant(variants, product_options)
+    if not large_variant:
         return None, variants, []
-    default_variant = None
-    for v in variants:
-        if v.get("is_default"):
-            default_variant = v
-            break
-    if not default_variant:
-        default_variant = variants[0]
-    cost = default_variant.get("cost", 0) / 100
+    cost = large_variant.get("cost", 0) / 100
     retail = float(target_retail)
     margin = ((retail - cost) / retail) if retail > 0 else 0
     updated = []
     for v in variants:
         v_cost = v.get("cost", 0) / 100
         v_price = round(v_cost / (1 - margin) + 0.00001, 2) if margin < 1.0 else v_cost
-        variant_payload = {
+        updated.append({
             "id": v["id"],
             "price": int(round(v_price * 100)),
             "is_enabled": v.get("is_enabled", True),
             "is_visible": v.get("is_visible", True)
-        }
-        updated.append(variant_payload)
+        })
     patch_url = f"https://api.printify.com/v1/shops/{shop_id}/products/{product_id}.json"
     payload = {"variants": updated}
     resp = requests.put(
@@ -175,7 +168,6 @@ def index():
         shop_id, detailed, found_types = get_shop_and_products()
     except Exception as e:
         return str(e), 400
-
     html = '''<!DOCTYPE html>
     <html>
     <head>
@@ -257,7 +249,7 @@ def index():
             <button type="submit">Save All</button>
             <button type="button" id="bulk-cancel">Cancel</button>
             <div style="margin-top:0.5em;color:#ccc;font-size:0.96em;">
-                Set a retail price (all other variants follow margin), a profit (adds $ to each cost), <b>or</b> a margin percentage (profit relative to cost).<br>
+                Set a retail price (all other variants follow margin, based on Large), a profit (adds $ to each cost), <b>or</b> a margin percentage (profit relative to cost, based on Large).<br>
                 All variants for each product will update accordingly.
             </div>
         </form>
@@ -269,7 +261,7 @@ def index():
                 <img src="{{ p.images[0].src }}">
                 {% endif %}
                 <div>
-                    <h2>{{ p.title }} <span class="default-size">(Default Size: {{ p.default_size }})</span></h2>
+                    <h2>{{ p.title }} <span class="default-size">(Large-Ref Size: {{ p.default_size }})</span></h2>
                     <div style="color:#888;">{{ p.vendor }}</div>
                 </div>
             </div>
@@ -356,9 +348,9 @@ def index():
                                 <br>
                                 <span style="font-size:0.93em;color:#888;">
                                     <b>When saving, all variants will be updated:</b><br>
-                                    • If you changed retail, all variants will update using that margin.<br>
+                                    • If you changed retail, all variants will update using that margin (based on Large).<br>
                                     • If you changed profit, all will get that profit added to their cost.<br>
-                                    • If you changed margin %, all will be priced for that margin.<br>
+                                    • If you changed margin %, all will be priced for that margin (based on Large).<br>
                                     (The field you changed most will be used.)
                                 </span>
                             </form>
@@ -470,7 +462,6 @@ def index():
         </script>
     </body>
     </html>'''
-    # Attach shipping cost per variant (only for default variant)
     for prod in detailed:
         for v in prod["variants"]:
             if v:
@@ -478,8 +469,6 @@ def index():
                 print_area_key = prod.get("print_area_key")
                 v["shipping_cost"] = get_variant_shipping_cost(provider_id, print_area_key)
     return render_template_string(html, products=detailed, found_types=found_types, messages=messages)
-
-# bulk_edit and edit_price_all endpoints remain unchanged
 
 @app.route("/bulk_edit", methods=["POST"])
 def bulk_edit():
@@ -504,15 +493,27 @@ def bulk_edit():
     summary_lines = []
     for pid in ids:
         if retail_val:
-            resp, variants, updated = update_all_prices_bulk_retail(pid, shop_id, float(retail_val))
-            msg_title = f"Set default variant to retail: ${float(retail_val):.2f} (others follow margin %)"
+            resp, variants, updated = update_all_prices_based_on_large(pid, shop_id, float(retail_val))
+            msg_title = f"Set Large-variant to retail: ${float(retail_val):.2f} (others follow margin)"
         elif profit_val:
             try:
                 value = float(profit_val)
             except Exception:
                 flash("Invalid profit value.", "error")
                 return redirect(url_for("index"))
-            variants = get_all_variants(pid, shop_id)
+            prod_resp = requests.get(
+                f"https://api.printify.com/v1/shops/{shop_id}/products/{pid}.json",
+                headers={"Authorization": f"Bearer {API_KEY}"}
+            )
+            prod_data = prod_resp.json()
+            product_options = prod_data.get("options", [])
+            variants = prod_data.get("variants", [])
+            large_variant = get_large_variant(variants, product_options)
+            if not large_variant:
+                flash("No variants found.", "error")
+                continue
+            large_cost = large_variant.get("cost", 0) / 100
+            margin = value / large_cost if large_cost else 0
             updated = []
             for v in variants:
                 cost = v.get("cost", 0) / 100
@@ -533,7 +534,7 @@ def bulk_edit():
                 },
                 json=payload
             )
-            msg_title = f"Set all variants to profit: ${value:.2f}"
+            msg_title = f"Set all variants to profit: ${value:.2f} (Large-based)"
         elif percent_val:
             try:
                 value = float(percent_val)
@@ -543,15 +544,27 @@ def bulk_edit():
             except Exception:
                 flash("Invalid percent value.", "error")
                 return redirect(url_for("index"))
-            variants = get_all_variants(pid, shop_id)
-            updated = []
+            prod_resp = requests.get(
+                f"https://api.printify.com/v1/shops/{shop_id}/products/{pid}.json",
+                headers={"Authorization": f"Bearer {API_KEY}"}
+            )
+            prod_data = prod_resp.json()
+            product_options = prod_data.get("options", [])
+            variants = prod_data.get("variants", [])
+            large_variant = get_large_variant(variants, product_options)
+            if not large_variant:
+                flash("No variants found.", "error")
+                continue
+            large_cost = large_variant.get("cost", 0) / 100
             margin = value / 100.0
+            retail = large_cost / (1 - margin) if margin < 1.0 else large_cost
+            updated = []
             for v in variants:
-                cost = v.get("cost", 0) / 100
-                price = cost / (1 - margin) if margin < 1.0 else cost
+                v_cost = v.get("cost", 0) / 100
+                v_price = round(v_cost / (1 - margin) + 0.00001, 2) if margin < 1.0 else v_cost
                 updated.append({
                     "id": v["id"],
-                    "price": int(round(price * 100)),
+                    "price": int(round(v_price * 100)),
                     "is_enabled": v.get("is_enabled", True),
                     "is_visible": v.get("is_visible", True)
                 })
@@ -565,56 +578,10 @@ def bulk_edit():
                 },
                 json=payload
             )
-            msg_title = f"Set all variants to margin: {round(value)}%"
+            msg_title = f"Set all variants to margin: {round(value)}% (Large-based)"
         else:
             flash("No pricing field set.", "error")
             return redirect(url_for("index"))
-
-            if mode == "profit":
-                updated = []
-                for v in variants:
-                    cost = v.get("cost", 0) / 100
-                    price = cost + value
-                    updated.append({
-                        "id": v["id"],
-                        "price": int(round(price * 100)),
-                        "is_enabled": v.get("is_enabled", True),
-                        "is_visible": v.get("is_visible", True)
-                    })
-                patch_url = f"https://api.printify.com/v1/shops/{shop_id}/products/{pid}.json"
-                payload = {"variants": updated}
-                resp = requests.put(
-                    patch_url,
-                    headers={
-                        "Authorization": f"Bearer {API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json=payload
-                )
-                msg_title = f"Set all variants to profit: ${value:.2f}"
-            elif mode == "percent":
-                updated = []
-                margin = value / 100.0
-                for v in variants:
-                    cost = v.get("cost", 0) / 100
-                    price = cost / (1 - margin) if margin < 1.0 else cost
-                    updated.append({
-                        "id": v["id"],
-                        "price": int(round(price * 100)),
-                        "is_enabled": v.get("is_enabled", True),
-                        "is_visible": v.get("is_visible", True)
-                    })
-                patch_url = f"https://api.printify.com/v1/shops/{shop_id}/products/{pid}.json"
-                payload = {"variants": updated}
-                resp = requests.put(
-                    patch_url,
-                    headers={
-                        "Authorization": f"Bearer {API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json=payload
-                )
-                msg_title = f"Set all variants to margin: {round(value)}%"
         product_title = product_lookup.get(str(pid), str(pid))
         if resp is None or resp.status_code != 200:
             try:
@@ -666,9 +633,19 @@ def edit_price_all():
     except Exception as e:
         flash(str(e), "error")
         return redirect(url_for("index"))
-    main_variant = get_all_variants(product_id, shop_id)[0]
-    old_retail = main_variant.get("price", 0) / 100
-    old_cost = main_variant.get("cost", 0) / 100
+    prod_resp = requests.get(
+        f"https://api.printify.com/v1/shops/{shop_id}/products/{product_id}.json",
+        headers={"Authorization": f"Bearer {API_KEY}"}
+    )
+    prod_data = prod_resp.json()
+    product_options = prod_data.get("options", [])
+    variants = prod_data.get("variants", [])
+    large_variant = get_large_variant(variants, product_options)
+    if not large_variant:
+        flash("No Large or fallback variant found.", "error")
+        return redirect(url_for("index"))
+    old_retail = large_variant.get("price", 0) / 100
+    old_cost = large_variant.get("cost", 0) / 100
     old_profit = old_retail - old_cost
     old_percent = (old_profit / old_retail * 100) if old_retail > 0 else 0
     try:
@@ -682,12 +659,11 @@ def edit_price_all():
     diff_profit = abs(new_profit - old_profit)
     diff_percent = abs(new_percent - old_percent)
     if diff_retail >= diff_profit and diff_retail >= diff_percent:
-        resp, variants, updated = update_all_prices_bulk_retail(product_id, shop_id, new_retail)
-        msg_title = f"Set default variant to retail: ${new_retail:.2f} (others follow margin %)"
+        resp, variants, updated = update_all_prices_based_on_large(product_id, shop_id, new_retail)
+        msg_title = f"Set Large-variant to retail: ${new_retail:.2f} (others follow margin)"
     elif diff_profit >= diff_retail and diff_profit >= diff_percent:
         value = new_profit
         updated = []
-        variants = get_all_variants(product_id, shop_id)
         for v in variants:
             cost = v.get("cost", 0) / 100
             price = cost + value
@@ -707,18 +683,17 @@ def edit_price_all():
             },
             json=payload
         )
-        msg_title = f"Set all variants to profit: ${value:.2f}"
+        msg_title = f"Set all variants to profit: ${value:.2f} (Large-based)"
     else:
         value = new_percent
         updated = []
         margin = value / 100.0
-        variants = get_all_variants(product_id, shop_id)
         for v in variants:
-            cost = v.get("cost", 0) / 100
-            price = cost / (1 - margin) if margin < 1.0 else cost
+            v_cost = v.get("cost", 0) / 100
+            v_price = round(v_cost / (1 - margin) + 0.00001, 2) if margin < 1.0 else v_cost
             updated.append({
                 "id": v["id"],
-                "price": int(round(price * 100)),
+                "price": int(round(v_price * 100)),
                 "is_enabled": v.get("is_enabled", True),
                 "is_visible": v.get("is_visible", True)
             })
@@ -732,7 +707,7 @@ def edit_price_all():
             },
             json=payload
         )
-        msg_title = f"Set all variants to margin: {round(value)}%"
+        msg_title = f"Set all variants to margin: {round(value)}% (Large-based)"
     if resp is None or resp.status_code != 200:
         try:
             err = resp.json()
@@ -741,7 +716,6 @@ def edit_price_all():
         flash(f"Failed to update: {err}", "error")
         return redirect(url_for("index"))
     confirm_rows = []
-    variants = get_all_variants(product_id, shop_id)
     for v in variants:
         new_row = next((u for u in updated if u["id"] == v["id"]), None)
         if new_row:
